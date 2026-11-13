@@ -28,6 +28,7 @@ import {
   addFollowerToIndex,
   assertUnreachable,
   createFollowerIndex,
+  deduplicateUsersById,
   fetchFriendshipsPage,
   FriendshipsListKind,
   FriendshipsPage,
@@ -464,6 +465,26 @@ function App() {
   }, [isActiveProcess, state]);
 
   useEffect(() => {
+    if (state.status !== "scanning" || isLocalPreview || state.percentage === 100) {
+      return;
+    }
+
+    const viewerId = getCookie("ds_user_id");
+    if (viewerId === null) {
+      setState(prevState =>
+        prevState.status === "scanning" ? { ...prevState, isScanningActive: false } : prevState,
+      );
+      setToast({ show: true, text: t(lang, "scanFailedFollowing") });
+      return;
+    }
+
+    const scanAccountChanged = new Error("Instagram account changed during scan");
+    const checkScanAccount = () => {
+      if (getCookie("ds_user_id") !== viewerId) {
+        throw scanAccountChanged;
+      }
+    };
+
     // Fetches one page, retrying with backoff on rate limits / network errors.
     // `blocked` is true when retries were exhausted for such a transient error
     // (the scan should stop); false means a different, non-retryable error
@@ -480,14 +501,15 @@ function App() {
       kind: FriendshipsListKind,
       maxId?: string,
       count?: number,
-      userId?: string,
     ): Promise<PageResult> => {
       let retries = 0;
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       while (true) {
+        checkScanAccount();
         try {
-          return { ok: true, page: await fetchFriendshipsPage(kind, maxId, count, userId) };
+          return { ok: true, page: await fetchFriendshipsPage(kind, maxId, count, viewerId) };
         } catch (e: any) {
+          checkScanAccount();
           const status = e?.status;
           const message = String(e?.message ?? "");
           const isRateLimitOrSoftBlock =
@@ -514,6 +536,7 @@ function App() {
               ? RATE_LIMIT_COOLDOWN_SECONDS * retries
               : 5 * retries;
             for (let sec = waitSeconds; sec > 0; sec--) {
+              checkScanAccount();
               setToast({
                 show: true,
                 text: t(lang, isRateLimitOrSoftBlock ? "rateLimitPause" : "networkRetry", sec),
@@ -523,7 +546,7 @@ function App() {
             setToast({ show: false });
             continue;
           }
-          console.error(`${kind} request failed${userId ? ` for ${userId}` : ""}:`, e);
+          console.error(`${kind} request failed:`, e);
           if (isRateLimitOrSoftBlock) {
             // Remember the 429 so the next scan/unfollow does not walk straight back into it.
             setBlockedUntil(Date.now() + BLOCKED_COOLDOWN_MS);
@@ -543,6 +566,7 @@ function App() {
     const paceRequest = async () => {
       // Pause scanning if user requested so.
       while (scanningPausedRef.current) {
+        checkScanAccount();
         await sleep(1000);
         console.info("Scan paused");
       }
@@ -585,6 +609,7 @@ function App() {
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       while (true) {
         const result = await fetchPageWithRetry(kind, maxId, timings.usersPerSearchCycle);
+        checkScanAccount();
         if (!result.ok) {
           console.error(`Stopping ${kind} scan early.`);
           return false;
@@ -621,22 +646,6 @@ function App() {
     };
 
     const scan = async () => {
-      if (state.status !== "scanning" || isLocalPreview) {
-        return;
-      }
-      if (state.percentage === 100) {
-        return;
-      }
-
-      const viewerId = getCookie("ds_user_id");
-      if (viewerId === null) {
-        setState(prevState =>
-          prevState.status === "scanning" ? { ...prevState, isScanningActive: false } : prevState,
-        );
-        setToast({ show: true, text: t(lang, "scanFailedFollowing") });
-        return;
-      }
-
       // Phase 1: Retrieve and index all of the viewer's followers.
       // We dual-index by ID and normalized lowercase username to guarantee zero false positives.
       const followerIndex = createFollowerIndex();
@@ -709,6 +718,7 @@ function App() {
           }
         },
       );
+      checkScanAccount();
 
       if (!followersCompleted) {
         // If followers list could not be fully loaded, aborting is mandatory.
@@ -751,21 +761,22 @@ function App() {
       // Phase 2: Walk the viewer's following list and check each against the follower index.
       // Accounts not in the index genuinely do not follow back and are progressively streamed to UI.
       const nonFollowers: UserNode[] = [];
+      const seenNonFollowerIds = new Set<string>();
       let checkedCount = 0;
 
       const checkFollowingPage = async (pageUsers: readonly RawFriendshipUser[]): Promise<boolean> => {
-        const newNonFollowersBatch: UserNode[] = [];
+        const nonFollowersBatch: UserNode[] = [];
 
         for (const user of pageUsers) {
           const followsViewer = isUserInFollowerIndex(followerIndex, user);
           if (!followsViewer) {
-            const node = rawFriendshipUserToUserNode(user, false);
-            nonFollowers.push(node);
-            newNonFollowersBatch.push(node);
+            nonFollowersBatch.push(rawFriendshipUserToUserNode(user, false));
           }
           checkedCount++;
         }
 
+        const newNonFollowersBatch = deduplicateUsersById(nonFollowersBatch, seenNonFollowerIds);
+        nonFollowers.push(...newNonFollowersBatch);
         const followingProgress = Math.min(99, 50 + Math.round(50 * (1 - 1 / (1 + checkedCount / 150))));
 
         setState(prevState =>
@@ -792,6 +803,7 @@ function App() {
         FOLLOWING_PAGE_SAFETY_LIMIT,
         checkFollowingPage,
       );
+      checkScanAccount();
 
       if (!followingCompleted && checkedCount === 0) {
         setState(prevState =>
@@ -807,11 +819,8 @@ function App() {
       const scanIsComplete = followingCompleted;
 
       if (scanIsComplete || nonFollowers.length > 0) {
-        // viewerId was captured when the scan started: cache under that account
-        // even if the cookie changed mid-scan, and never offer the old account's
-        // results as "previous scan" for the new one.
         saveCachedScanResults(nonFollowers, viewerId);
-        setCachedScan(getCookie("ds_user_id") === viewerId ? { results: nonFollowers, timestamp: Date.now() } : null);
+        setCachedScan({ results: nonFollowers, timestamp: Date.now() });
       }
 
       setState(prevState => {
@@ -835,7 +844,16 @@ function App() {
           : t(lang, "partialScanInterrupted", checkedCount),
       });
     };
-    scan();
+    scan().catch(error => {
+      if (error !== scanAccountChanged) {
+        throw error;
+      }
+      scanningPausedRef.current = false;
+      setScanningPaused(false);
+      setCachedScan(loadCachedScanResults());
+      setState({ status: "initial" });
+      setToast({ show: true, text: t(lang, "scanAccountChanged") });
+    });
     // Dependency array not entirely legit, but works this way. TODO: Find a way to fix.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.status, scanRunId]);
